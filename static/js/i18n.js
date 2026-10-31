@@ -118,6 +118,7 @@ const I18N = {
     's.backup': 'النسخ الاحتياطي', 's.backup_keep': 'عدد النسخ المحفوظة', 's.backup_now': 'إنشاء نسخة احتياطية الآن',
     's.backup_auto': 'يُنشئ النظام نسخة احتياطية تلقائية يوميًا في مجلد data/backups.', 's.download': 'تنزيل', 's.size': 'الحجم',
     's.backup_done': 'تم إنشاء النسخة الاحتياطية: {n}',
+    's.backup_managed': 'قاعدة البيانات على Neon، وهي تحتفظ بسجل استعادة تلقائي. للاستعادة استخدم لوحة تحكم Neon.',
     // audit
     'a.title': 'سجل التدقيق والأحداث', 'a.at': 'الوقت', 'a.user': 'المستخدم', 'a.action': 'الإجراء', 'a.entity': 'الكيان',
     'a.ip': 'IP', 'a.system': 'النظام',
@@ -260,6 +261,7 @@ const I18N = {
     's.backup': 'Backups', 's.backup_keep': 'Backups to keep', 's.backup_now': 'Create backup now',
     's.backup_auto': 'An automatic backup is created daily in data/backups.', 's.download': 'Download', 's.size': 'Size',
     's.backup_done': 'Backup created: {n}',
+    's.backup_managed': 'The database is on Neon, which keeps an automatic restore history. Use the Neon console to restore.',
     'a.title': 'Audit & event log', 'a.at': 'Time', 'a.user': 'User', 'a.action': 'Action', 'a.entity': 'Entity',
     'a.ip': 'IP', 'a.system': 'System',
     'act.login': 'Sign in', 'act.logout': 'Sign out', 'act.login_failed': 'Failed sign-in', 'act.create': 'Create',

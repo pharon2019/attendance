@@ -2,16 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 نظام الحضور والانصراف — Attendance & Departure System
-Backend server: Python 3.10+ standard library only (no pip install needed).
+Backend server: Python 3.10+ standard library only (no pip install needed) with SQLite.
+Set DATABASE_URL to use PostgreSQL (e.g. Neon) instead; that needs `pip install "psycopg[binary]"`.
 
     py server.py                 # run (seeds demo data on first start)
     py server.py --port 8443     # custom port
     py server.py --reset-demo    # wipe the database and re-create demo data
     py server.py --no-demo       # first start without demo data (creates admin only)
+
+On Vercel the module-level WSGI `app` is the entry point (see pyproject.toml).
 """
 import argparse
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import logging
@@ -30,6 +34,7 @@ import traceback
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
+from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
@@ -42,6 +47,14 @@ BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 CERT_FILE = os.path.join(BASE_DIR, 'certs', 'cert.pem')
 KEY_FILE = os.path.join(BASE_DIR, 'certs', 'key.pem')
+DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL') or ''
+USE_PG = DATABASE_URL.startswith(('postgres://', 'postgresql://'))
+ON_VERCEL = bool(os.environ.get('VERCEL'))
+if USE_PG:
+    import psycopg
+    IntegrityError = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    IntegrityError = sqlite3.IntegrityError
 
 SESSION_COOKIE = 'att_session'
 SESSION_DAYS = 30
@@ -125,7 +138,11 @@ CREATE TABLE IF NOT EXISTS audit_log(
   id INTEGER PRIMARY KEY, at TEXT NOT NULL, user_id INTEGER, username TEXT, action TEXT NOT NULL,
   entity TEXT, entity_id INTEGER, details TEXT, reason TEXT, ip TEXT);
 CREATE INDEX IF NOT EXISTS ix_audit_at ON audit_log(at);
+CREATE TABLE IF NOT EXISTS login_fails(ip TEXT NOT NULL, at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_login_fails ON login_fails(ip, at);
 """
+PG_TABLES = ('audit_log', 'punches', 'leaves', 'sessions', 'users', 'employees', 'shifts', 'locations',
+             'departments', 'settings', 'login_fails')
 
 
 # ---------------------------------------------------------------- helpers
@@ -235,10 +252,135 @@ def verify_password(pw, stored):
 
 
 def connect():
+    if USE_PG:
+        return PgDB(pg_connect())
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     return db
+
+
+# ---------------------------------------------------------------- PostgreSQL (Neon) backend
+# The SQL in this file is written for SQLite; PgDB adapts it so the same statements run on PostgreSQL.
+
+class PgRow(dict):
+    """dict row that also supports row[0], like sqlite3.Row."""
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return list(self.values())[k]
+        return dict.__getitem__(self, k)
+
+
+def pg_row_factory(cur):
+    names = [c.name for c in cur.description] if cur.description else []
+    return lambda values: PgRow(zip(names, values))
+
+
+PG_NO_ID = {'settings', 'sessions', 'login_fails'}  # tables without an id column
+RX_INSERT = re.compile(r'\s*INSERT\s+INTO\s+(\w+)', re.I)
+RX_WRITE = re.compile(r'\s*(INSERT|UPDATE|DELETE)\b', re.I)
+RX_LIKE = re.compile(r'\bLIKE\b')
+
+
+def pg_sql(sql):
+    """? placeholders -> %s; LIKE -> ILIKE (SQLite's LIKE ignores case)."""
+    return RX_LIKE.sub('ILIKE', sql.replace('%', '%%').replace('?', '%s'))
+
+
+def pg_params(params):
+    return [int(p) if isinstance(p, bool) else p for p in params]
+
+
+class PgCursor:
+    def __init__(self, cur, lastrowid=None):
+        self._cur, self.lastrowid = cur, lastrowid
+
+    def fetchone(self):
+        return self._cur.fetchone() if self._cur.description else None
+
+    def fetchall(self):
+        return self._cur.fetchall() if self._cur.description else []
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class PgDB:
+    """The subset of the sqlite3.Connection API this server uses, on a psycopg connection."""
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=()):
+        ins = RX_INSERT.match(sql)
+        write = ins or RX_WRITE.match(sql)
+        q = pg_sql(sql)
+        returning = bool(ins) and ins.group(1).lower() not in PG_NO_ID
+        if returning:
+            q += ' RETURNING id'
+        cur = self.conn.cursor(row_factory=pg_row_factory)
+        if write:  # a failed write must not abort the whole transaction (SQLite keeps it usable)
+            cur.execute('SAVEPOINT w')
+        try:
+            cur.execute(q, pg_params(params))
+        except psycopg.Error:
+            if write:
+                cur.execute('ROLLBACK TO SAVEPOINT w')
+            raise
+        return PgCursor(cur, cur.fetchone()[0] if returning else None)
+
+    def executemany(self, sql, seq):
+        with self.conn.cursor() as cur:
+            cur.executemany(pg_sql(sql), [pg_params(p) for p in seq])
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        pg_release(self.conn)
+
+
+PG_POOL = []  # idle connections kept for reuse: (conn, last_used)
+PG_LOCK = threading.Lock()
+
+
+def pg_connect():
+    with PG_LOCK:
+        while PG_POOL:
+            conn, used = PG_POOL.pop()
+            if time.time() - used < 60 and not conn.closed:
+                return conn
+            conn.close()
+    # prepare_threshold=None: Neon's pooled endpoint (PgBouncer) does not keep prepared statements
+    return psycopg.connect(DATABASE_URL, prepare_threshold=None, connect_timeout=10)
+
+
+def pg_release(conn):
+    try:
+        conn.rollback()  # end anything left uncommitted
+    except psycopg.Error:
+        conn.close()
+        return
+    with PG_LOCK:
+        if not conn.closed and not conn.broken and len(PG_POOL) < 4:
+            PG_POOL.append((conn, time.time()))
+            return
+    conn.close()
+
+
+def pg_schema(sql):
+    return (sql.replace('INTEGER PRIMARY KEY', 'INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY')
+               .replace(' REAL', ' DOUBLE PRECISION').replace(' COLLATE NOCASE', ''))
+
+
+def pg_sync_ids(db):
+    """After inserting explicit ids (demo data) move each identity sequence past them."""
+    for t in PG_TABLES:
+        if t not in PG_NO_ID:
+            db.execute(f"SELECT setval(pg_get_serial_sequence('{t}', 'id'), "
+                       f"COALESCE((SELECT MAX(id) FROM {t}), 0) + 1, false)")
 
 
 def get_settings(db):
@@ -433,15 +575,11 @@ def scope_sql(ids, col):
     if ids is None:
         return '', []
     if not ids:
-        return ' AND 0', []
+        return ' AND 1=0', []
     return f' AND {col} IN ({",".join("?" * len(ids))})', list(ids)
 
 
 # ---------------------------------------------------------------- auth
-
-LOGIN_FAILS = {}  # ip -> [timestamps]
-LOGIN_LOCK = threading.Lock()
-
 
 def user_public(db, u):
     emp = None
@@ -459,21 +597,17 @@ def api_login(ctx):
     b = ctx.body
     username = str(b.get('username') or '').strip()
     pw = str(b.get('password') or '')
-    t = time.time()
-    with LOGIN_LOCK:
-        fails = [x for x in LOGIN_FAILS.get(ctx.ip, []) if t - x < 900]
-        LOGIN_FAILS[ctx.ip] = fails
-        if len(fails) >= 20:
-            raise ApiError(429, 'too_many_attempts')
-    u = ctx.db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
     now = now_utc()
+    since = iso(now - timedelta(minutes=15))  # failures per IP are kept in the database (shared by all instances)
+    if ctx.db.execute('SELECT COUNT(*) FROM login_fails WHERE ip=? AND at>?', (ctx.ip, since)).fetchone()[0] >= 20:
+        raise ApiError(429, 'too_many_attempts')
+    u = ctx.db.execute('SELECT * FROM users WHERE lower(username)=lower(?)', (username,)).fetchone()
     if u and u['locked_until'] and u['locked_until'] > iso(now):
         left = max(1, mins(parse_iso(u['locked_until']) - now))
         raise ApiError(423, 'account_locked', minutes=left)
     ok = verify_password(pw, u['pw_hash'] if u else DUMMY_HASH)
     if not u or not ok:
-        with LOGIN_LOCK:
-            LOGIN_FAILS.setdefault(ctx.ip, []).append(t)
+        ctx.db.execute('INSERT INTO login_fails(ip,at) VALUES(?,?)', (ctx.ip, iso(now)))
         if u:
             failed = u['failed'] + 1
             locked = iso(now + timedelta(minutes=10)) if failed >= 5 else None
@@ -490,6 +624,7 @@ def api_login(ctx):
                    (hashlib.sha256(token.encode()).hexdigest(), u['id'],
                     iso(now + timedelta(days=SESSION_DAYS)), iso(now), ctx.ip))
     ctx.db.execute('DELETE FROM sessions WHERE expires_at<?', (iso(now),))
+    ctx.db.execute('DELETE FROM login_fails WHERE at<?', (since,))
     ctx.user = dict(u)
     ctx.audit('login', 'user', u['id'])
     ctx.db.commit()
@@ -730,7 +865,7 @@ def api_punch(ctx):
              iso(now), 1 if offline else 0, lat, lng, acc, str(b.get('address') or '')[:300] or None,
              distance, in_fence, 'mobile', str(ctx.h.headers.get('User-Agent') or '')[:200],
              site['id'] if site else None))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         reject(ctx, emp_id, 'already_checked_in' if typ == 'in' else 'already_checked_out')
     ctx.audit('punch_' + typ, 'punch', cur.lastrowid,
               {'employee_id': emp_id, 'work_date': work_date, 'offline': offline, 'distance_m': distance,
@@ -848,7 +983,7 @@ def api_ent_list(ctx):
     spec = ent_spec(ctx)
     a = spec['alias']
     base = spec.get('select') or f'SELECT {a}.* FROM {spec["table"]} {a}'
-    where, args = ' WHERE 1', []
+    where, args = ' WHERE 1=1', []
     q = (ctx.q('q') or '').strip()
     if q and spec.get('search'):
         where += ' AND (' + ' OR '.join(f'{c} LIKE ?' for c in spec['search']) + ')'
@@ -862,7 +997,7 @@ def api_ent_list(ctx):
         s, sa = scope_sql(ctx.scope_ids(), spec['scope_col'])
         where += s
         args += sa
-    total = ctx.db.execute(f'SELECT COUNT(*) FROM ({base}{where})', args).fetchone()[0]
+    total = ctx.db.execute(f'SELECT COUNT(*) FROM ({base}{where}) t_count', args).fetchone()[0]
     size = max(1, min(ctx.qint('size', 25), 2000))
     page = max(1, ctx.qint('page', 1))
     rows = ctx.db.execute(f'{base}{where} ORDER BY {spec["order"]} LIMIT ? OFFSET ?',
@@ -933,7 +1068,7 @@ def api_ent_delete(ctx):
         raise ApiError(409, 'has_records')
     try:
         ctx.db.execute(f'DELETE FROM {spec["table"]} WHERE id=?', (rid,))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise ApiError(409, 'in_use')
     ctx.audit('delete', spec['table'], rid, dict(row))
     ctx.db.commit()
@@ -950,7 +1085,7 @@ def api_lookups(ctx):
         'locations': [dict(r) for r in db.execute('SELECT * FROM locations ORDER BY id')],
         'employees': [dict(r) for r in db.execute(
             f'SELECT id, emp_no, name_ar, name_en, department_id, shift_id, location_id, extra_location_ids, status '
-            f'FROM employees WHERE 1{s} '
+            f'FROM employees WHERE 1=1{s} '
             'ORDER BY emp_no', sa)],
     }
 
@@ -972,7 +1107,7 @@ def check_role_allowed(ctx, role):
 @route('GET', '/api/users', ADMIN_HR)
 def api_users(ctx):
     q = (ctx.q('q') or '').strip()
-    where, args = 'WHERE 1', []
+    where, args = 'WHERE 1=1', []
     if q:
         where += ' AND (u.username LIKE ? OR e.name_ar LIKE ? OR e.name_en LIKE ? OR e.emp_no LIKE ?)'
         args += [f'%{q}%'] * 4
@@ -998,7 +1133,7 @@ def api_user_create(ctx):
         raise ApiError(400, 'required', field='employee_id')
     pw = str(b.get('password') or '')
     check_password_policy(pw)
-    if ctx.db.execute('SELECT 1 FROM users WHERE username=?', (username,)).fetchone():
+    if ctx.db.execute('SELECT 1 FROM users WHERE lower(username)=lower(?)', (username,)).fetchone():
         raise ApiError(409, 'duplicate', field='username')
     cur = ctx.db.execute(
         'INSERT INTO users(username,pw_hash,role,employee_id,active,lang,created_at) VALUES(?,?,?,?,?,?,?)',
@@ -1078,7 +1213,8 @@ def api_settings_update(ctx):
                 raise ApiError(400, 'invalid', field=k)
             if ctx.st.get(k) != v:
                 diff[k] = [ctx.st.get(k), v]
-                ctx.db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', (k, v))
+                ctx.db.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                               'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (k, v))
     if diff:
         ctx.audit('update', 'settings', None, diff)
         ctx.db.commit()
@@ -1087,7 +1223,7 @@ def api_settings_update(ctx):
 
 @route('GET', '/api/audit', ADMIN_HR)
 def api_audit(ctx):
-    where, args = ' WHERE 1', []
+    where, args = ' WHERE 1=1', []
     for f in ('action', 'entity'):
         if ctx.q(f):
             where += f' AND {f}=?'
@@ -1143,6 +1279,8 @@ def backup_loop():
 
 @route('GET', '/api/backups', ADMIN)
 def api_backups(ctx):
+    if USE_PG:  # PostgreSQL (Neon) keeps its own restore history; there are no backup files
+        return {'items': [], 'managed': True}
     os.makedirs(BACKUP_DIR, exist_ok=True)
     items = []
     for f in sorted(os.listdir(BACKUP_DIR), reverse=True):
@@ -1155,6 +1293,8 @@ def api_backups(ctx):
 
 @route('POST', '/api/backups', ADMIN)
 def api_backup_create(ctx):
+    if USE_PG:
+        raise ApiError(400, 'backups_managed')
     name = make_backup('manual')
     ctx.audit('backup', 'backup', None, {'file': name})
     ctx.db.commit()
@@ -1186,8 +1326,8 @@ def api_punches(ctx):
         where += ' AND e.department_id=?'
         args.append(ctx.qint('department_id', 0))
     if ctx.q('source'):
-        where += " AND (p.source=? OR (?='offline' AND p.is_offline=1))"
-        args += [ctx.q('source'), ctx.q('source')]
+        where += ' AND (p.source=? OR p.is_offline=1)' if ctx.q('source') == 'offline' else ' AND p.source=?'
+        args.append(ctx.q('source'))
     q = (ctx.q('q') or '').strip()
     if q:
         where += ' AND (e.emp_no LIKE ? OR e.name_ar LIKE ? OR e.name_en LIKE ?)'
@@ -1241,7 +1381,7 @@ def api_punch_manual(ctx):
         cur = ctx.db.execute(
             '''INSERT INTO punches(uuid,employee_id,type,work_date,punch_time,synced_at,source,note)
                VALUES(?,?,?,?,?,?,?,?)''', (str(uuid.uuid4()), emp_id, typ, wd, iso(pt), iso(now), 'manual', reason))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise ApiError(409, 'already_checked_in' if typ == 'in' else 'already_checked_out')
     ctx.audit('create', 'punches', cur.lastrowid, {'employee_id': emp_id, 'type': typ, 'work_date': wd,
                                                    'punch_time': iso(pt)}, reason)
@@ -1908,7 +2048,7 @@ class Handler(BaseHTTPRequestHandler):
                 extra += [('Set-Cookie', c) for c in ctx.cookies_out]
             self.send_body(e.status, json.dumps({'error': e.code, 'params': e.params}, ensure_ascii=False).encode(),
                            'application/json; charset=utf-8', extra)
-        except sqlite3.IntegrityError as e:
+        except IntegrityError as e:
             log.warning('integrity error on %s %s: %s', method, path, e)
             self.send_body(409, b'{"error":"conflict","params":{}}', 'application/json', extra)
         except Exception:
@@ -1944,19 +2084,46 @@ class Handler(BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------- database init & demo data
 
-def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    db = connect()
-    db.execute('PRAGMA journal_mode=WAL')
-    db.executescript(SCHEMA)
-    for table, col, ddl in (('employees', 'extra_location_ids', "TEXT NOT NULL DEFAULT ''"),
-                            ('punches', 'location_id', 'INTEGER')):
-        if col not in {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}:
-            db.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
+def init_db(demo=True):
+    """Create/upgrade the schema and, on an empty database, the first accounts."""
+    if USE_PG:
+        db = connect()
+        db.execute('SELECT pg_advisory_xact_lock(7240531)')  # serverless instances may start at the same time
+        for stmt in pg_schema(SCHEMA).split(';'):
+            if stmt.strip():
+                db.execute(stmt)
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_ci ON users(lower(username))')
+    else:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        db = connect()
+        db.execute('PRAGMA journal_mode=WAL')
+        db.executescript(SCHEMA)
+        for table, col, ddl in (('employees', 'extra_location_ids', "TEXT NOT NULL DEFAULT ''"),
+                                ('punches', 'location_id', 'INTEGER')):
+            if col not in {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}:
+                db.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
     for k, v in DEFAULT_SETTINGS.items():
-        db.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)', (k, v))
+        db.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING', (k, v))
+    if not db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
+        if demo:
+            print('  Creating demo data ... / جارٍ إنشاء البيانات التجريبية ...')
+            seed_demo(db)
+        else:
+            create_initial_admin(db)
     db.commit()
-    return db
+    db.close()
+
+
+def reset_db():
+    if USE_PG:
+        db = connect()
+        db.execute(f'DROP TABLE IF EXISTS {", ".join(PG_TABLES)} CASCADE')
+        db.commit()
+        db.close()
+        return
+    for suffix in ('', '-wal', '-shm'):
+        if os.path.exists(DB_PATH + suffix):
+            os.remove(DB_PATH + suffix)
 
 
 def seed_demo(db):
@@ -2064,6 +2231,8 @@ def seed_demo(db):
             if t_out and t_out + timedelta(seconds=30) < now_l:
                 add(i, 'out', d.isoformat(), t_out + timedelta(seconds=rnd.randint(0, 59)), locs[loc])
     audit(db, None, 'demo_seed', details={'employees': len(emps)})
+    if USE_PG:
+        pg_sync_ids(db)
     db.commit()
 
 
@@ -2095,8 +2264,77 @@ def lan_ip():
         return '127.0.0.1'
 
 
+def startup(debug=False, demo=True):
+    """Logging, database schema and first accounts. Shared by main() and the WSGI app."""
+    global DUMMY_HASH
+    handlers = [logging.StreamHandler(sys.stdout)] if sys.stdout else []  # no console under pythonw
+    if not ON_VERCEL:  # Vercel's file system is read-only; its log viewer shows stdout
+        os.makedirs(DATA_DIR, exist_ok=True)
+        handlers.append(logging.FileHandler(os.path.join(DATA_DIR, 'server.log'), encoding='utf-8'))
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s', handlers=handlers)
+    if ON_VERCEL and not USE_PG:
+        raise RuntimeError('DATABASE_URL is not set: connect a Neon database to the Vercel project')
+    DUMMY_HASH = hash_password(secrets.token_hex(8))
+    init_db(demo)
+
+
+# ---------------------------------------------------------------- WSGI entry point (Vercel)
+
+class WsgiHandler(Handler):
+    """Runs Handler for one WSGI request instead of a socket connection; the response is collected."""
+    def __init__(self, environ):
+        self.client_address = (environ.get('REMOTE_ADDR') or '0.0.0.0', 0)
+        self.command = environ['REQUEST_METHOD']
+        qs = environ.get('QUERY_STRING')
+        self.path = (environ.get('PATH_INFO') or '/') + ('?' + qs if qs else '')
+        self.headers = http.client.HTTPMessage()
+        for k, v in environ.items():
+            if k.startswith('HTTP_'):
+                self.headers[k[5:].replace('_', '-')] = v
+        for k in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
+            if environ.get(k):
+                self.headers[k.replace('_', '-')] = environ[k]
+        self.rfile = environ['wsgi.input']
+        self.wfile = io.BytesIO()
+        self.request_version = 'HTTP/1.1'
+        self.plain_http = False
+        self.status, self.out_headers, self._headers_buffer = 500, [], []
+
+    def send_response(self, code, message=None):
+        self.status = code
+
+    def send_header(self, keyword, value):
+        self.out_headers.append((keyword, str(value)))
+
+    def flush_headers(self):
+        self._headers_buffer = []
+
+
+APP_READY = False
+APP_LOCK = threading.Lock()
+
+
+def app(environ, start_response):
+    """WSGI application: Vercel runs this behind its HTTPS edge."""
+    global APP_READY, BEHIND_PROXY, USE_TLS, PROXY_ANY_PEER
+    if not APP_READY:
+        with APP_LOCK:
+            if not APP_READY:
+                BEHIND_PROXY = USE_TLS = PROXY_ANY_PEER = True  # client IP from X-Real-IP, secure cookies
+                startup(demo=os.environ.get('ATT_DEMO') == '1')
+                APP_READY = True
+    h = WsgiHandler(environ)
+    if h.command in ('GET', 'POST', 'PUT', 'DELETE'):
+        h.dispatch(h.command)
+    else:
+        h.send_body(405, b'', 'text/plain')
+    start_response(f'{h.status} {HTTPStatus(h.status).phrase}', h.out_headers)
+    return [h.wfile.getvalue()]
+
+
 def main():
-    global USE_TLS, DUMMY_HASH, SSL_CTX, BEHIND_PROXY, PROXY_ANY_PEER
+    global USE_TLS, SSL_CTX, BEHIND_PROXY, PROXY_ANY_PEER
     ap = argparse.ArgumentParser(description='Attendance system server')
     ap.add_argument('--host', default=os.environ.get('ATT_HOST'))
     ap.add_argument('--port', type=int, default=int(os.environ.get('ATT_PORT') or os.environ.get('PORT') or '8000'))
@@ -2108,24 +2346,9 @@ def main():
     ap.add_argument('--debug', action='store_true')
     args = ap.parse_args()
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
-                        format='%(asctime)s %(levelname)s %(message)s',
-                        handlers=([logging.StreamHandler(sys.stdout)] if sys.stdout else []) +  # no console under pythonw
-                                 [logging.FileHandler(os.path.join(DATA_DIR, 'server.log'), encoding='utf-8')])
-    DUMMY_HASH = hash_password(secrets.token_hex(8))
-    if args.reset_demo and os.path.exists(DB_PATH):
-        for suffix in ('', '-wal', '-shm'):
-            if os.path.exists(DB_PATH + suffix):
-                os.remove(DB_PATH + suffix)
-    db = init_db()
-    if not db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
-        if args.no_demo:
-            create_initial_admin(db)
-        else:
-            print('  Creating demo data ... / جارٍ إنشاء البيانات التجريبية ...')
-            seed_demo(db)
-    db.close()
+    if args.reset_demo:
+        reset_db()
+    startup(args.debug, demo=not args.no_demo)
 
     if args.behind_proxy:
         BEHIND_PROXY = USE_TLS = True  # the proxy serves HTTPS: secure cookies + HSTS
@@ -2145,7 +2368,8 @@ def main():
         SSL_CTX = sslctx  # sockets are wrapped per connection in Handler.setup (allows http -> https redirect)
         USE_TLS = True
         scheme = 'https'
-    threading.Thread(target=backup_loop, daemon=True).start()
+    if not USE_PG:
+        threading.Thread(target=backup_loop, daemon=True).start()
     print(f'\n  Attendance system running / النظام يعمل:\n    {scheme}://localhost:{args.port}\n' +
           ('' if args.behind_proxy else f'    {scheme}://{lan_ip()}:{args.port}   (phones on the same network)\n'))
     if not USE_TLS and not args.behind_proxy:

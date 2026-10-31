@@ -16,3 +16,7 @@ venv/
 Thumbs.db
 .DS_Store
 .vscode/
+
+# Vercel
+.vercel/
+.env*

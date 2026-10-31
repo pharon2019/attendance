@@ -71,6 +71,17 @@ Run `py server.py --behind-proxy`, then `online.ps1` (temporary URL) or `online.
 
 Create the project from the GitHub repo, attach a volume at `/data`, set `ATT_DATA_DIR=/data` and `ATT_ADMIN_PASSWORD`, then generate a domain. Railway supplies `PORT`; the server reads the client IP from `X-Real-IP`.
 
+### الاستضافة على Vercel مع قاعدة Neon · Hosting on Vercel + Neon
+
+عند تعيين المتغير `DATABASE_URL` يستخدم الخادم PostgreSQL (Neon) بدل ملف SQLite. على Vercel يعمل الخادم كدالة (`server:app` في `pyproject.toml`).
+
+1. في Vercel: Add New ← Project ← استورد المستودع من GitHub.
+2. Storage ← Create Database ← Neon، واربطها بالمشروع (يضيف `DATABASE_URL` تلقائيًا).
+3. أضف المتغير `ATT_ADMIN_PASSWORD` (كلمة مرور حساب `admin` عند أول تشغيل)، ثم Deploy.
+4. النسخ الاحتياطي تتولاه Neon (استعادة لأي لحظة سابقة من لوحة تحكم Neon).
+
+Import the GitHub repo into Vercel, add a Neon database from Vercel's Storage tab (it sets `DATABASE_URL`), set `ATT_ADMIN_PASSWORD`, and deploy. Without `DATABASE_URL` the server keeps using SQLite, so running it on this PC is unchanged. `ATT_DEMO=1` seeds demo data on an empty database.
+
 ---
 
 ## 2. إدارة المستخدمين والصلاحيات · Users & roles

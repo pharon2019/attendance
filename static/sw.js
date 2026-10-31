@@ -1,6 +1,6 @@
 /* Service worker: keeps the app shell available offline so employees can punch without a connection.
    API calls are never cached — offline punches are queued by the app itself (localStorage) and synced later. */
-const VERSION = 'att-v3';
+const VERSION = 'att-v4';
 const SHELL = ['/', '/index.html', '/css/app.css', '/js/i18n.js', '/js/app.js', '/manifest.webmanifest',
   '/icons/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png'];
 

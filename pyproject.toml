@@ -1,0 +1,10 @@
+[project]
+name = "attendance"
+version = "1.0.0"
+description = "Attendance & departure system"
+requires-python = ">=3.12"
+# Only needed with DATABASE_URL (PostgreSQL / Neon); the SQLite mode uses the standard library only.
+dependencies = ["psycopg[binary]>=3.2"]
+
+[tool.vercel]
+entrypoint = "server:app"

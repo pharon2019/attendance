@@ -1239,13 +1239,18 @@ async function pageSettings(view) {
     <form id="s-form" class="settings">
       ${groups.map(([g, fs]) => `<section class="card"><h3>${t(g)}</h3><div class="grid-form">${fs.map(([key, type]) =>
         fieldHtml({ key, type, label: t('s.' + key), dir: key === 'company_en' ? 'ltr' : undefined }, type === 'check' ? s[key] === '1' : s[key])).join('')}</div></section>`).join('')}
-      <section class="card"><h3>${t('s.backup')}</h3><p class="muted small">${t('s.backup_auto')}</p>
+      <section class="card"><h3>${t('s.backup')}</h3><p class="muted small" id="bk-note">${t('s.backup_auto')}</p>
         <div class="grid-form">${fieldHtml({ key: 'backup_keep', type: 'number', label: t('s.backup_keep') }, s.backup_keep)}</div>
         <button type="button" class="btn" id="bk-now">${t('s.backup_now')}</button><div id="bk-list"></div></section>
       <div class="sticky-save"><button class="btn primary" type="submit">${t('c.save')}</button></div>
     </form>`;
   const loadBackups = async () => {
-    const { items } = await api('GET', '/api/backups');
+    const { items, managed } = await api('GET', '/api/backups');
+    if (managed) { // PostgreSQL (Neon): restore points are managed by the database service
+      $('#bk-note').textContent = t('s.backup_managed');
+      $('#bk-now').hidden = true;
+      return;
+    }
     $('#bk-list').innerHTML = table([
       { label: t('f.name'), html: r => `<span dir="ltr">${esc(r.name)}</span>` },
       { label: t('a.at'), html: r => `<span dir="ltr">${fmtDT(r.at)}</span>` },
