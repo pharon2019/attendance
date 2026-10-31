@@ -2315,6 +2315,19 @@ APP_READY = False
 APP_LOCK = threading.Lock()
 
 
+def startup_error_text(e):
+    if not USE_PG:
+        why = ('DATABASE_URL is not set. Connect the Neon database to this Vercel project '
+               '(Storage tab), then redeploy.\n'
+               'لم يتم ضبط DATABASE_URL. اربط قاعدة Neon بهذا المشروع من تبويب Storage ثم أعد النشر.')
+    else:
+        why = ('Could not connect to the database (DATABASE_URL is set). Check that the Neon database is active '
+               'and the connection string is correct; details are in the Vercel function logs.\n'
+               'تعذّر الاتصال بقاعدة البيانات. تحقق من قاعدة Neon ومن رابط الاتصال؛ التفاصيل في سجلات Vercel.\n\n'
+               f'{type(e).__name__}')
+    return 'Attendance system: startup failed / فشل تشغيل النظام\n\n' + why
+
+
 def app(environ, start_response):
     """WSGI application: Vercel runs this behind its HTTPS edge."""
     global APP_READY, BEHIND_PROXY, USE_TLS, PROXY_ANY_PEER
@@ -2322,8 +2335,14 @@ def app(environ, start_response):
         with APP_LOCK:
             if not APP_READY:
                 BEHIND_PROXY = USE_TLS = PROXY_ANY_PEER = True  # client IP from X-Real-IP, secure cookies
-                startup(demo=os.environ.get('ATT_DEMO') == '1')
-                APP_READY = True
+                try:
+                    startup(demo=os.environ.get('ATT_DEMO') == '1')
+                    APP_READY = True
+                except Exception as e:  # show why instead of a bare 500; the next request tries again
+                    log.error('startup failed\n%s', traceback.format_exc())
+                    print(f'startup failed: {e!r}', flush=True)
+                    start_response('503 Service Unavailable', [('Content-Type', 'text/plain; charset=utf-8')])
+                    return [startup_error_text(e).encode('utf-8')]
     h = WsgiHandler(environ)
     if h.command in ('GET', 'POST', 'PUT', 'DELETE'):
         h.dispatch(h.command)
