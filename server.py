@@ -50,6 +50,7 @@ PBKDF2_ITER = 150_000
 USE_TLS = False
 SSL_CTX = None
 BEHIND_PROXY = False  # behind Cloudflare Tunnel / a reverse proxy that terminates HTTPS
+PROXY_ANY_PEER = False  # behind a hosted proxy (Railway): listening on all interfaces, reachable only via the proxy
 
 log = logging.getLogger('attendance')
 
@@ -343,8 +344,10 @@ def route(method, pattern, roles=None):
 
 def client_ip(handler):
     ip = handler.client_address[0]
-    if BEHIND_PROXY and ip in ('127.0.0.1', '::1'):  # only trust the header when the proxy is local
-        fwd = handler.headers.get('CF-Connecting-IP') or (handler.headers.get('X-Forwarded-For') or '').split(',')[0]
+    # trust the header only when the proxy is local, or on a hosted platform (Railway) whose edge is the only way in
+    if BEHIND_PROXY and (PROXY_ANY_PEER or ip in ('127.0.0.1', '::1')):
+        fwd = (handler.headers.get('X-Real-IP') if PROXY_ANY_PEER else handler.headers.get('CF-Connecting-IP')) \
+            or (handler.headers.get('X-Forwarded-For') or '').split(',')[0]
         ip = fwd.strip()[:45] or ip
     return ip
 
@@ -2093,14 +2096,15 @@ def lan_ip():
 
 
 def main():
-    global USE_TLS, DUMMY_HASH, SSL_CTX, BEHIND_PROXY
+    global USE_TLS, DUMMY_HASH, SSL_CTX, BEHIND_PROXY, PROXY_ANY_PEER
     ap = argparse.ArgumentParser(description='Attendance system server')
-    ap.add_argument('--host', default=os.environ.get('ATT_HOST', '0.0.0.0'))
-    ap.add_argument('--port', type=int, default=int(os.environ.get('ATT_PORT', '8000')))
+    ap.add_argument('--host', default=os.environ.get('ATT_HOST'))
+    ap.add_argument('--port', type=int, default=int(os.environ.get('ATT_PORT') or os.environ.get('PORT') or '8000'))
     ap.add_argument('--reset-demo', action='store_true', help='delete the database and recreate demo data')
     ap.add_argument('--no-demo', action='store_true', help='on first start create only an admin account')
     ap.add_argument('--behind-proxy', action='store_true', default=os.environ.get('ATT_BEHIND_PROXY') == '1',
-                    help='run behind Cloudflare Tunnel or another HTTPS reverse proxy (listens on 127.0.0.1 only)')
+                    help='run behind Cloudflare Tunnel or another HTTPS reverse proxy '
+                         '(listens on 127.0.0.1 unless --host is given, e.g. 0.0.0.0 on Railway)')
     ap.add_argument('--debug', action='store_true')
     args = ap.parse_args()
 
@@ -2125,12 +2129,15 @@ def main():
 
     if args.behind_proxy:
         BEHIND_PROXY = USE_TLS = True  # the proxy serves HTTPS: secure cookies + HSTS
-        args.host = '127.0.0.1'
+        args.host = args.host or '127.0.0.1'
+        PROXY_ANY_PEER = args.host not in ('127.0.0.1', '::1', 'localhost')
+    else:
+        args.host = args.host or '0.0.0.0'
     httpd = Server((args.host, args.port), Handler)
     httpd.daemon_threads = True
     scheme = 'http'
     if args.behind_proxy:
-        print(f'\n  Behind proxy: listening on http://127.0.0.1:{args.port} for the tunnel / reverse proxy.')
+        print(f'\n  Behind proxy: listening on http://{args.host}:{args.port} for the tunnel / reverse proxy.')
     elif os.path.isfile(CERT_FILE) and os.path.isfile(KEY_FILE):
         sslctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         sslctx.minimum_version = ssl.TLSVersion.TLSv1_2

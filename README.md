@@ -60,6 +60,17 @@ Browsers only expose GPS over HTTPS. Run `gen_cert.bat` for a self-signed LAN ce
 
 Run `py server.py --behind-proxy`, then `online.ps1` (temporary URL) or `online.ps1 -Token <token>` (permanent hostname on your Cloudflare domain, installed as a Windows service). **Change the demo passwords before going public.**
 
+### الاستضافة على Railway · Hosting on Railway
+
+يعمل الخادم على Railway دون الحاجة لتشغيل هذا الجهاز. الإعداد في `railway.json` (يبدأ بـ `--behind-proxy --host 0.0.0.0 --no-demo`).
+
+1. New Project ← Deploy from GitHub repo ← اختر المستودع.
+2. أضف Volume للخدمة بمسار التركيب `/data` (وإلا تُحذف البيانات مع كل نشر).
+3. المتغيرات (Variables): `ATT_DATA_DIR=/data` و `ATT_ADMIN_PASSWORD=<كلمة مرور قوية>` (تُستخدم عند أول تشغيل فقط لإنشاء حساب `admin`).
+4. Settings ← Networking ← Generate Domain للحصول على رابط `https://….up.railway.app`.
+
+Create the project from the GitHub repo, attach a volume at `/data`, set `ATT_DATA_DIR=/data` and `ATT_ADMIN_PASSWORD`, then generate a domain. Railway supplies `PORT`; the server reads the client IP from `X-Real-IP`.
+
 ---
 
 ## 2. إدارة المستخدمين والصلاحيات · Users & roles
